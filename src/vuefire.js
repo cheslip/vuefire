@@ -77,7 +77,7 @@ function indexForKey (array, key) {
  * @param {string} key
  * @param {object} source
  */
-function bind (vm, key, source) {
+function bind (vm, key, source, joinSource) {
   var asObject = false
   var cancelCallback = null
   // check { source, asArray, cancelCallback } syntax
@@ -95,9 +95,37 @@ function bind (vm, key, source) {
   // bind based on initial value type
   if (asObject) {
     bindAsObject(vm, key, source, cancelCallback)
-  } else {
+  } else if (joinSource) {
+    bindAsArrayWithJoin(vm, key, source, joinSource, cancelCallback)
+  } else {  
     bindAsArray(vm, key, source, cancelCallback)
   }
+}
+
+function bindKeys (vm, vmKey, keys, source) {
+  var cancelCallback = null
+  // check { source, asArray, cancelCallback } syntax
+  if (isObject(source) && source.hasOwnProperty('source')) {
+    cancelCallback = source.cancelCallback
+    source = source.source
+  }
+  if (!isObject(source)) {
+    throw new Error('VueFire: invalid Firebase binding source.')
+  }
+
+  var arr = [];
+
+  keys.forEach(function(key) {
+    var childSource = source.child(key)
+    var childKey = vmKey + '-' + key
+    var ref = _getRef(childSource)
+    vm.$firebaseRefs[childKey] = ref
+    vm._firebaseSources[childKey] = childSource
+
+    bindAsObject(vm, childKey, childSource, cancelCallback, arr);
+  });
+
+  defineReactive(vm, vmKey, arr);
 }
 
 /**
@@ -158,6 +186,45 @@ function bindAsArray (vm, key, source, cancelCallback) {
   }
 }
 
+function bindAsArrayWithJoin (vm, key, source, joinSource, cancelCallback) {
+  var array = []
+  defineReactive(vm, key, array)
+
+  var onAdd = source.on('child_added', function (snapshot, prevKey) {
+    var snapKey = _getKey(snapshot);
+    var index = prevKey ? indexForKey(array, prevKey) + 1 : 0
+    array.splice(index, 0, createRecord(snapshot))
+    bindAsObjectToArray(array, index, snapKey, joinSource.child(snapKey), cancelCallback)
+  }, cancelCallback)
+
+  var onRemove = source.on('child_removed', function (snapshot) {
+    var index = indexForKey(array, _getKey(snapshot))
+    unbind(array[index], _getKey(snapshot));
+    array.splice(index, 1)
+  }, cancelCallback)
+
+  var onChange = source.on('child_changed', function (snapshot) {
+    var snapKey = _getKey(snapshot);
+    var index = indexForKey(array, snapKey)
+    array.splice(index, 1, createRecord(snapshot))
+    bindAsObjectToArray(array, index, snapKey, joinSource.child(snapKey), cancelCallback)
+  }, cancelCallback)
+
+  var onMove = source.on('child_moved', function (snapshot, prevKey) {
+    var index = indexForKey(array, _getKey(snapshot))
+    var record = array.splice(index, 1)[0]
+    var newIndex = prevKey ? indexForKey(array, prevKey) + 1 : 0
+    array.splice(newIndex, 0, record)
+  }, cancelCallback)
+
+  vm._firebaseListeners[key] = {
+    child_added: onAdd,
+    child_removed: onRemove,
+    child_changed: onChange,
+    child_moved: onMove
+  }
+}
+
 /**
  * Bind a firebase data source to a key on a vm as an Object.
  *
@@ -172,6 +239,29 @@ function bindAsObject (vm, key, source, cancelCallback) {
     vm[key] = createRecord(snapshot)
   }, cancelCallback)
   vm._firebaseListeners[key] = { value: cb }
+}
+
+/**
+ * 
+ * 
+ * @param {Array} arr
+ * @param {number} index
+ * @param {string} key
+ * @param {Object} source
+ * @param {function|null} cancelCallback
+ */
+function bindAsObjectToArray (arr, index, key, source, cancelCallback) {
+
+  var cb = source.on('value', function (snapshot) {
+    Vue.set(arr, index, createRecord(snapshot))
+
+    var ref = _getRef(source)
+    ensureRefs(arr[index])
+    arr[index].$firebaseRefs[key] = ref
+    arr[index]._firebaseSources[key] = source
+    arr[index]._firebaseListeners[key] = { value: cb }
+
+  }, cancelCallback)
 }
 
 /**
@@ -266,6 +356,14 @@ function install (_Vue) {
       source: source,
       cancelCallback: cancelCallback
     })
+  }
+
+  Vue.prototype.$bindKeysAsArray = function (key, source, joinSource, cancelCallback) {
+    ensureRefs(this)
+    bind(this, key, {
+        source: source,
+        cancelCallback: cancelCallback
+    }, joinSource);
   }
 
   Vue.prototype.$unbind = function (key) {
